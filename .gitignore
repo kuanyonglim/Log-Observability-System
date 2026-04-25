@@ -1,0 +1,7 @@
+.env
+venv/
+__psycache__/
+*.pyc
+*.pptx
+*.pdf
+*.docx

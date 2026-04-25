@@ -1,0 +1,4 @@
+kafka-python==2.3.1     # Used for producing log messages to Kafka topics
+python-dotenv==1.0.1    # Used for loading environment variables from .env file into the application
+dotenv==0.9.9           # Used for loading environment variables from .env file into the application    
+faker==24.3.0           # Used for generating synthetic log messages
