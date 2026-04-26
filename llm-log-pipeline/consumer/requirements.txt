@@ -1,7 +1,7 @@
 kafka-python==2.3.1     # Used for consuming log messages from Kafka topics
 scikit-learn==1.5.2     # Used for Isolation Forest
 numpy==1.26.4           # Used for numpy arrays for scikit-learn inputs
-sqlalchemy==2.0.29      # Used for Object Relational Mapping (ORM) to interact with PostgreSQL database
-psycopg2-binary==2.9.9  # PostgreSQL driver. SQLAlchemy is the interface; psycopg2 is the engine under the hood. '-binary' means pre-compiled - no C compiler required in the container.
+sqlalchemy==2.0.35      # Used for Object Relational Mapping (ORM) to interact with PostgreSQL database
+psycopg2-binary==2.9.10  # PostgreSQL driver. SQLAlchemy is the interface; psycopg2 is the engine under the hood. '-binary' means pre-compiled - no C compiler required in the container.
 python-dotenv==1.0.1    # Used for loading environment variables from .env file into the application    
 dotenv==0.9.9           # Used for loading environment variables from .env file into the application    

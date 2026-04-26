@@ -1,0 +1,9 @@
+fastapi==0.110.1            # the web framework. Handles routing, request parsing, response serialization
+uvicorn[standard]==0.29.0   # the ASGI server that runs FastAPI. FastAPI is just a framework — it needs a server to actually listen for HTTP requests.
+                            # [standard] adds WebSocket support and faster JSON parsing
+sqlalchemy==2.0.35
+psycopg2-binary==2.9.10
+anthropic==0.34.0           # Anthropic's official Python SDK. Handles auth, retries, and streaming to the Claude API
+python-dotenv==1.0.1
+pydantic==2.9.0             # data validation library. FastAPI uses it to validate request bodies and serialize responses. Pydantic v2 is 5-50x faster than v1 (rewritten in Rust)
+httpx==0.27.2
