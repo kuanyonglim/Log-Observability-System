@@ -1,0 +1,5 @@
+streamlit==1.33.0       # the dashboard framework
+requests==2.31.0        # makes HTTP calls to our FastAPI backend. The dashboard never talks to the DB directly — always goes through the API
+pandas==2.2.2           # Streamlit's chart functions expect DataFrames. We convert API JSON responses into pandas DataFrames for plotting
+plotly==5.20.0          # interactive charts (hover, zoom, pan). Much better than matplotlib for dashboards. Streamlit has native plotly support
+python-dotenv==1.0.1    # reads .env so the dashboard knows the API URL
