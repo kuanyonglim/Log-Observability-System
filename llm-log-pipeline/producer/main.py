@@ -225,6 +225,11 @@ class FaultScheduler:
 
 # ── Main Loop ─────────────────────────────────────────────────────
 def main() -> None:
+    # Give Kafka extra time to fully initialize on first Docker Startup.
+    # Healthchecks help but Kafka's internal setup takes a few extra seconds.
+    logger.info("Waiting 15 seconds for infrastructure to stabilise...")
+    time.sleep(15)
+
     producer    = create_producer()
     fault_sched = FaultScheduler(interval=120, duration=20)
     events_sent = 0

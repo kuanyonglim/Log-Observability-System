@@ -185,6 +185,9 @@ def write_anomaly_alert(
 
 # ── Main Loop ─────────────────────────────────────────────────────
 def main() -> None:
+    logger.info("Waiting 20s for infrastructure to stabilise...")
+    time.sleep(20)
+
     # ── Setup DB ─────────────────────────────────────────────────
     engine          = get_engine(DATABASE_URL)
     SessionFactory  = get_session_factory(engine)
