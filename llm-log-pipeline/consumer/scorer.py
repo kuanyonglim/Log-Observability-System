@@ -103,7 +103,7 @@ class AnomalyScorer:
 
         # predict returns 1 (normal) or -1 (anomaly)
         prediction    = self.model.predict(X)[0]
-        is_anomaly    = prediction == -1
+        is_anomaly    = bool(prediction == -1)
 
         # Buffer this window for future retraining
         self._window_buffer.append(X.flatten())

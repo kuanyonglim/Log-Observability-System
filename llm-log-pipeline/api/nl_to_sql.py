@@ -133,7 +133,7 @@ def validate_sql(sql: str) -> tuple[bool, str]:
         return False, "Query must not contain SQL comments"
 
     # Enforce reasonable length — a valid query shouldn't be > 2000 chars
-    if len(sql) > 2000:
+    if len(sql) > 500:
         return False, "Query too long"
 
     return True, ""

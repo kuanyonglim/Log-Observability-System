@@ -12,9 +12,9 @@ Keeping them separate means you can change one without breaking the other.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Annotated
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 
 # ── Response Schemas ──────────────────────────────────────────────
@@ -65,15 +65,20 @@ class AnomalyAlertResponse(BaseModel):
 # ── Request Schemas ───────────────────────────────────────────────
 
 class NLQueryRequest(BaseModel):
-    """Body of POST /query"""
-    question: str        # the plain-English question from the user
-    limit:    int = 100  # max rows to return — prevents runaway queries
+    # Annotated lets us attach constraints to a type.
+    # StringConstraints is the Pydantic v2 way to add string-specific rules.
+    # strip_whitespace=True: "   " → "" before min_length is checked.
+    # min_length=1: after stripping, empty string fails → 422 response.
+    question: Annotated[str, StringConstraints(
+        strip_whitespace=True,
+        min_length=1
+    )]
+    limit: int = Field(default=100, ge=1, le=500)
 
     model_config = ConfigDict(
-        # Provide an example that shows up in /docs UI
         json_schema_extra={
             "example": {
-                "question": "Show me all ERROR logs from the payment service in the last 10 minutes",
+                "question": "Show me all ERROR logs from the payment service",
                 "limit": 50
             }
         }
