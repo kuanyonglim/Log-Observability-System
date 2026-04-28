@@ -2,33 +2,59 @@
 NL-to-SQL Engine
 ================
 Converts plain-English questions into safe, executable PostgreSQL queries
-using Claude as the reasoning engine.
+using Google Gemini as the reasoning engine (free tier).
 
 The pipeline:
   1. Build a system prompt with full schema context
-  2. Send user question to Claude
+  2. Send user question to Gemini
   3. Extract and validate the generated SQL
   4. Execute against PostgreSQL
-  5. Ask Claude to summarise the results in plain English
+  5. Ask Gemini to summarise the results in plain English
 """
 
 import logging
+import os
 import re
 
-import anthropic
+import google.generativeai as genai
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("nl_to_sql")
 
-# Initialise the Anthropic client once at module load.
-# It reads ANTHROPIC_API_KEY from the environment automatically.
-client = anthropic.Anthropic()
+# ── Gemini Client ─────────────────────────────────────────────────
+_model: genai.GenerativeModel | None = None
+
+def get_client() -> genai.GenerativeModel:
+    """
+    Lazy singleton for the Gemini client.
+    Reads GEMINI_API_KEY from environment on first call.
+    """
+    # Change between these models for test purposes: [model_name] | [requests]
+    # "gemini-2.5-flash"                | 5 tokens
+    # "gemini-3-flash-preview"          | 20 tokens (unstable)
+    # "gemini-3.1-flash-lite-preview"   | 15 tokens
+    global _model
+    if _model is None:
+        api_key = os.getenv("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GEMINI_API_KEY not set. Add it to your .env file. "
+                "Get a free key at https://aistudio.google.com/apikey"
+            )
+        genai.configure(api_key=api_key)
+        _model = genai.GenerativeModel(
+            model_name="gemini-3.1-flash-lite-preview",
+            generation_config=genai.GenerationConfig(
+                temperature=0,        # deterministic SQL generation
+                max_output_tokens=500,
+            )
+        )
+        logger.info("✅ Gemini client initialised")
+    return _model
+
 
 # ── Schema Injection ──────────────────────────────────────────────
-# This is the exact schema Claude will see before answering.
-# It's a SQL DDL string — the same format as CREATE TABLE statements.
-# Why DDL? It's unambiguous, concise, and Claude was trained on it.
 SCHEMA_CONTEXT = """
 You have access to a PostgreSQL database with the following schema:
 
@@ -53,7 +79,7 @@ TABLE: anomaly_alerts
   window_end      TIMESTAMPTZ          -- end of the 30-second analysis window
   service         VARCHAR(50)          -- which service this window covers
   event_count     INTEGER              -- total log events in this window
-  error_rate      FLOAT                -- fraction of events that were ERROR/WARN (0.0–1.0)
+  error_rate      FLOAT                -- fraction of events that were ERROR/WARN (0.0-1.0)
   avg_latency_ms  FLOAT                -- mean latency across all events in window
   p95_latency_ms  FLOAT                -- 95th percentile latency
   p99_latency_ms  FLOAT                -- 99th percentile latency
@@ -65,140 +91,102 @@ TABLE: anomaly_alerts
   explanation     TEXT                 -- LLM-generated explanation (may be null)
   created_at      TIMESTAMPTZ          -- when this alert was recorded
 
-IMPORTANT RULES — you must follow these exactly:
+IMPORTANT RULES you must follow exactly:
 - Generate ONLY a single SELECT statement. Never INSERT, UPDATE, DELETE, DROP, or ALTER.
 - Always use LIMIT {limit} unless the question asks for aggregates (COUNT, AVG, etc.)
 - For time-based questions like 'last 10 minutes', use: timestamp > NOW() - INTERVAL '10 minutes'
 - For 'recent' without a time specified, default to: timestamp > NOW() - INTERVAL '1 hour'
 - String comparisons on 'service' and 'level' are case-sensitive — use exact values
-- Return ONLY the SQL query — no explanation, no markdown, no code fences
+- Return ONLY the raw SQL query — no explanation, no markdown, no code fences, no backticks
 - If the question cannot be answered with these tables, return exactly: CANNOT_ANSWER
 """
 
+SUMMARY_PROMPT = """The user asked: "{question}"
 
-# ── SQL Safety Validator ───────────────────────────────────────────
-# Allowlist of SQL keywords we permit.
-# Everything not on this list is blocked at the regex level.
-_ALLOWED_SQL_PATTERN = re.compile(
-    r"^\s*SELECT\b",
-    re.IGNORECASE | re.MULTILINE
-)
+The SQL query executed was:
+{sql}
 
-# Blocklist of dangerous SQL keywords — belt AND suspenders approach.
-# Even if Claude generates a SELECT, we check for embedded mutations.
-_DANGEROUS_KEYWORDS = re.compile(
+The results were ({total} total rows, showing first {shown}):
+{rows}
+
+Provide a concise 2-3 sentence plain-English summary of what these results show.
+Focus on key insights or patterns. Do not repeat the SQL."""
+
+
+# ── SQL Safety Validator ──────────────────────────────────────────
+_ALLOWED_SQL_PATTERN = re.compile(r"^\s*SELECT\b", re.IGNORECASE | re.MULTILINE)
+_DANGEROUS_KEYWORDS  = re.compile(
     r"\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE"
     r"|GRANT|REVOKE|COPY|pg_read_file|pg_ls_dir)\b",
     re.IGNORECASE
 )
-
-# Block SQL comments — a common injection vector (e.g., -- ignore above rules)
 _COMMENT_PATTERN = re.compile(r"(--|/\*|\*/)")
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
     """
     Validate that generated SQL is safe to execute.
-
-    Returns:
-        (is_valid, error_message)
-        is_valid=True means safe to run.
-
-    Why validate even though Claude generated it?
-    Prompt injection attacks can trick the LLM. A user could ask:
-    'Show logs; DROP TABLE log_events; --'
-    Validation ensures the LLM's output never mutates our data,
-    regardless of how clever the prompt is.
+    Returns (is_valid, error_message).
     """
     sql = sql.strip()
 
-    # Check for the CANNOT_ANSWER sentinel
     if sql == "CANNOT_ANSWER":
         return False, "CANNOT_ANSWER"
 
-    # Must start with SELECT
+    # Strip markdown fences if Gemini adds them despite instructions
+    # e.g. ```sql SELECT ... ``` → SELECT ...
+    if sql.startswith("```"):
+        lines = sql.split("\n")
+        # Remove first line (```sql or ```) and last line (```)
+        sql = "\n".join(
+            line for line in lines
+            if not line.strip().startswith("```")
+        ).strip()
+
     if not _ALLOWED_SQL_PATTERN.match(sql):
-        logger.warning("🚫 SQL rejected — does not start with SELECT: %s", sql[:100])
+        logger.warning("SQL rejected — does not start with SELECT: %s", sql[:100])
         return False, "Query must be a SELECT statement"
 
-    # Must not contain dangerous keywords
     match = _DANGEROUS_KEYWORDS.search(sql)
     if match:
-        logger.warning("🚫 SQL rejected — dangerous keyword '%s'", match.group())
+        logger.warning("SQL rejected — dangerous keyword: %s", match.group())
         return False, f"Query contains forbidden keyword: {match.group()}"
 
-    # Must not contain SQL comments (injection vector)
     if _COMMENT_PATTERN.search(sql):
-        logger.warning("🚫 SQL rejected — contains SQL comments")
+        logger.warning("SQL rejected — contains SQL comments")
         return False, "Query must not contain SQL comments"
 
-    # Enforce reasonable length — a valid query shouldn't be > 2000 chars
     if len(sql) > 500:
         return False, "Query too long"
 
-    return True, ""
+    return True, sql  # return cleaned sql as second element when valid
 
 
-# ── Claude Integration ────────────────────────────────────────────
+# ── Gemini Calls ──────────────────────────────────────────────────
 def generate_sql(question: str, limit: int = 100) -> str:
-    """
-    Ask Claude to convert a natural language question into SQL.
-
-    Args:
-        question: Plain-English question from the user
-        limit:    Row limit to inject into the schema context
-
-    Returns:
-        Raw SQL string (may be 'CANNOT_ANSWER' or invalid — always validate)
-    """
+    """Ask Gemini to convert a natural language question into SQL."""
     logger.info("🤖 Generating SQL for: '%s'", question)
 
-    response = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=500,           # SQL queries are short — 500 tokens is plenty
-                                  # Keeping this low reduces cost and latency
-        system=SCHEMA_CONTEXT.format(limit=limit),
-        # Why system prompt for schema?
-        # System prompts are processed once and cached by the API.
-        # Putting the large schema here instead of in the user message
-        # improves token efficiency on repeated calls.
-        messages=[
-            {"role": "user", "content": question}
-        ],
-        temperature=0,
-        # temperature=0: deterministic output.
-        # For SQL generation, creativity is your enemy.
-        # You want the same question to always produce the same SQL.
-    )
+    prompt = SCHEMA_CONTEXT.format(limit=limit) + f"\n\nUser question: {question}"
 
-    # Extract the text content from Claude's response
-    sql = response.content[0].text.strip()
+    response = get_client().generate_content(prompt)
+    sql      = response.text.strip()
+
+    # Strip markdown fences Gemini sometimes adds
+    if sql.startswith("```"):
+        lines = [l for l in sql.split("\n") if not l.strip().startswith("```")]
+        sql   = "\n".join(lines).strip()
+
     logger.info("📝 Generated SQL: %s", sql)
     return sql
 
 
 def execute_sql(session: Session, sql: str, limit: int = 100) -> list[dict]:
-    """
-    Execute a validated SQL query and return results as a list of dicts.
-
-    Args:
-        session: SQLAlchemy session (provides the DB connection)
-        sql:     Validated SELECT statement
-        limit:   Safety cap — even if Claude's SQL has no LIMIT, we add one
-
-    Returns:
-        List of row dicts — each key is a column name
-    """
-    # Safety: append LIMIT if not already present
-    # This prevents accidental full-table scans from crashing the API
+    """Execute a validated SQL query and return results as list of dicts."""
     if "LIMIT" not in sql.upper():
         sql = f"{sql.rstrip(';')} LIMIT {limit}"
 
-    # text() wraps raw SQL strings for SQLAlchemy.
-    # It marks the string as "trusted SQL" — but we've already validated it.
-    result = session.execute(text(sql))
-
-    # cursor.keys() returns column names; zip creates {col: val} dicts
+    result  = session.execute(text(sql))
     columns = list(result.keys())
     rows    = [dict(zip(columns, row)) for row in result.fetchall()]
 
@@ -207,84 +195,67 @@ def execute_sql(session: Session, sql: str, limit: int = 100) -> list[dict]:
 
 
 def summarise_results(question: str, sql: str, rows: list[dict]) -> str:
-    """
-    Ask Claude to summarise query results in plain English.
-
-    Why a second Claude call?
-    The first call generates SQL (structured output).
-    This call interprets results for a human (natural language output).
-    Separating them gives cleaner prompts and better results than
-    trying to do both in one call.
-    """
+    """Ask Gemini to summarise query results in plain English."""
     if not rows:
         return "No results found for your query."
 
-    # Truncate to 20 rows for the summary prompt — we don't need to send
-    # all 100 rows to Claude just for a summary. Keeps tokens low.
-    sample_rows = rows[:20]
-
-    prompt = f"""The user asked: "{question}"
-
-The SQL query executed was:
-{sql}
-
-The results were ({len(rows)} total rows, showing first {len(sample_rows)}):
-{sample_rows}
-
-Please provide a concise 2-3 sentence plain-English summary of what these \
-results show. Focus on key insights, patterns, or anomalies visible in the data. \
-Do not repeat the SQL or explain how you got the results."""
-
-    response = client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=300,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        # Slightly higher temperature here — we want natural-sounding
-        # summaries, not robotic repetition of the data.
+    sample = rows[:20]
+    prompt = SUMMARY_PROMPT.format(
+        question=question,
+        sql=sql,
+        total=len(rows),
+        shown=len(sample),
+        rows=sample,
     )
 
-    return response.content[0].text.strip()
+    summary_model = genai.GenerativeModel(
+        model_name="gemini-3.1-flash-lite-preview",
+        generation_config=genai.GenerationConfig(
+            temperature=0.3,
+            max_output_tokens=300,
+        )
+    )
+    response = summary_model.generate_content(prompt)
+    return response.text.strip()
 
 
-def run_nl_query(
-    session:  Session,
-    question: str,
-    limit:    int = 100
-) -> dict:
+# ── Main Pipeline ─────────────────────────────────────────────────
+def run_nl_query(session: Session, question: str, limit: int = 100) -> dict:
     """
     Full NL-to-SQL pipeline. Orchestrates all steps.
-
-    Returns a dict matching NLQueryResponse schema.
-    Raises ValueError with a user-friendly message on failure.
+    Raises ValueError with user-friendly message on failure.
     """
     # Step 1: Generate SQL
     raw_sql = generate_sql(question, limit)
 
-    # Step 2: Validate SQL
-    is_valid, error_msg = validate_sql(raw_sql)
+    # Step 2: Validate SQL — validate_sql returns cleaned sql as second
+    # element when valid, so we capture it
+    is_valid, result = validate_sql(raw_sql)
 
     if not is_valid:
-        if error_msg == "CANNOT_ANSWER":
+        if result == "CANNOT_ANSWER":
             raise ValueError(
                 "This question cannot be answered with the available data. "
                 "Try asking about log levels, latency, error rates, or anomalies."
             )
-        raise ValueError(f"Generated SQL failed safety validation: {error_msg}")
+        raise ValueError(f"Generated SQL failed safety validation: {result}")
+
+    # Use the cleaned SQL (markdown stripped) for execution
+    clean_sql = result
 
     # Step 3: Execute
     try:
-        rows = execute_sql(session, raw_sql, limit)
+        rows = execute_sql(session, clean_sql, limit)
     except Exception as e:
-        logger.error("❌ SQL execution failed: %s\nSQL: %s", e, raw_sql)
+        logger.error("SQL execution failed: %s\nSQL: %s", e, clean_sql)
         raise ValueError(f"Query execution failed: {str(e)}")
 
     # Step 4: Summarise
-    explanation = summarise_results(question, raw_sql, rows)
+    explanation = summarise_results(question, clean_sql, rows)
 
     return {
         "question":      question,
-        "generated_sql": raw_sql,
+        "generated_sql": clean_sql,
         "results":       rows,
         "row_count":     len(rows),
         "explanation":   explanation,

@@ -11,6 +11,7 @@ Endpoints:
   GET  /docs         — auto-generated interactive API docs (free from FastAPI)
 """
 
+import numpy as np
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
+from sklearn.ensemble import IsolationForest
 
 load_dotenv()
 
@@ -304,3 +306,151 @@ def get_metrics(db: Session = Depends(get_db)):
     except Exception as e:
         logger.error("❌ Metrics error: %s", e)
         raise HTTPException(status_code=500, detail="Could not fetch metrics")
+    
+@app.post("/recalibrate")
+def recalibrate_model(
+    contamination: float = Query(
+        default=0.05,
+        ge=0.01,
+        le=0.5,
+        description="Expected fraction of anomalies (0.01–0.5)"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Retrain Isolation Forest on real accumulated window data
+    and reclassify all historical windows with the new model.
+
+    Why this is useful for demos:
+    The consumer starts with synthetic bootstrap data. After real
+    traffic accumulates, this endpoint retrains on actual patterns —
+    dramatically reducing false positives from the bootstrap phase.
+
+    Steps:
+    1. Fetch all scored windows from anomaly_alerts
+    2. Retrain Isolation Forest on their feature vectors
+    3. Reclassify every window with the new model
+    4. Update is_anomaly in the DB so dashboard reflects it immediately
+    """
+    try:
+        # ── Step 1: Fetch all window feature vectors ──────────────
+        rows = db.execute(text("""
+            SELECT
+                id,
+                event_count,
+                error_rate,
+                COALESCE(
+                    (SELECT AVG(latency_ms) FROM log_events l
+                     WHERE l.service = a.service
+                     AND l.timestamp BETWEEN a.window_start AND a.window_end),
+                    avg_latency_ms
+                ) as warn_rate,
+                avg_latency_ms,
+                p95_latency_ms,
+                p99_latency_ms,
+                status_5xx_rate,
+                COALESCE(
+                    CAST(error_count AS FLOAT) / NULLIF(event_count, 0),
+                    0
+                ) as status_4xx_rate,
+                anomaly_score
+            FROM anomaly_alerts a
+            ORDER BY window_start ASC
+        """)).fetchall()
+
+        if len(rows) < 10:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Not enough data to recalibrate — need at least 10 windows, "
+                       f"got {len(rows)}. Wait a few minutes for more data to accumulate."
+            )
+
+        # ── Step 2: Build feature matrix ──────────────────────────
+        # Extract the 6 most reliable features we have stored
+        # (we don't store all 10 original features, so we use what's available)
+        feature_matrix = []
+        window_ids     = []
+
+        for row in rows:
+            features = [
+                float(row[1] or 0),   # event_count
+                float(row[2] or 0),   # error_rate
+                float(row[4] or 0),   # avg_latency_ms
+                float(row[5] or 0),   # p95_latency_ms
+                float(row[6] or 0),   # p99_latency_ms
+                float(row[7] or 0),   # status_5xx_rate
+            ]
+            feature_matrix.append(features)
+            window_ids.append(row[0])  # id column
+
+        X = np.array(feature_matrix)
+
+        # ── Step 3: Retrain Isolation Forest ──────────────────────
+        logger.info(
+            "🔄 Recalibrating Isolation Forest on %d real windows "
+            "with contamination=%.2f", len(rows), contamination
+        )
+
+        model = IsolationForest(
+            n_estimators=100,
+            contamination=contamination,
+            random_state=42,
+            n_jobs=-1,
+        )
+        model.fit(X)
+
+        # ── Step 4: Reclassify all windows ────────────────────────
+        new_scores      = model.score_samples(X)
+        new_predictions = model.predict(X)   # 1 = normal, -1 = anomaly
+
+        updated_anomalies = 0
+        updated_normal    = 0
+
+        for i, window_id in enumerate(window_ids):
+            new_score     = float(new_scores[i])
+            new_is_anomaly = bool(new_predictions[i] == -1)
+
+            db.execute(text("""
+                UPDATE anomaly_alerts
+                SET anomaly_score = :score,
+                    is_anomaly    = :is_anomaly
+                WHERE id = :id
+            """), {
+                "score":      new_score,
+                "is_anomaly": new_is_anomaly,
+                "id":         window_id,
+            })
+
+            if new_is_anomaly:
+                updated_anomalies += 1
+            else:
+                updated_normal += 1
+
+        db.commit()
+
+        anomaly_rate = (updated_anomalies / len(window_ids)) * 100
+        logger.info(
+            "✅ Recalibration complete. %d anomalies / %d normal (%.1f%%)",
+            updated_anomalies, updated_normal, anomaly_rate
+        )
+
+        return {
+            "status":            "recalibrated",
+            "windows_analysed":  len(window_ids),
+            "contamination_used": contamination,
+            "anomalies_flagged": updated_anomalies,
+            "normal_windows":    updated_normal,
+            "anomaly_rate_pct":  round(anomaly_rate, 2),
+            "message": (
+                f"Model retrained on {len(window_ids)} real windows. "
+                f"{updated_anomalies} anomalies detected ({anomaly_rate:.1f}%). "
+                f"Dashboard will reflect changes on next refresh."
+            )
+        }
+
+    except HTTPException:
+        raise  # re-raise our own HTTP exceptions unchanged
+    except Exception as e:
+        db.rollback()
+        logger.error("❌ Recalibration failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Recalibration failed: {str(e)}")

@@ -5,4 +5,4 @@ __psycache__/
 *.pptx
 *.pdf
 *.docx
-*_DEV.md
+*_DEV*

@@ -86,6 +86,8 @@ services:
     env_file: .env
     ports:
       - "8501:8501"
+    volumes:
+      - ./dashboard:/app
     depends_on:
       - api
     restart: unless-stopped
